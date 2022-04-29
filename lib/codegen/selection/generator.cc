@@ -62,21 +62,23 @@ Value* multiplier::operator()(Value *x, Value *y, const std::string &name) {
 
 Value* geper::operator()(Value *ptr, Value* off, const std::string& name){
   // (ptr + cst1) + (cst2) -> ptr + (cst1 + cst2)
+  auto elem_ty = ptr->getType()->getNonOpaquePointerElementType();
   if(auto* gep = dyn_cast<GetElementPtrInst>(ptr))
   if(ConstantInt* cst1 = dyn_cast<ConstantInt>(gep->idx_begin()))
   if(ConstantInt* cst2 = dyn_cast<ConstantInt>(off)){
-    return (*builder_)->CreateGEP(gep->getPointerOperand(),
-                                  (*builder_)->CreateAdd(cst1, cst2));
+    return (*builder_)->CreateGEP( elem_ty, gep->getPointerOperand(),
+      // {cst1, cst2});
+      (*builder_)->CreateAdd(cst1, cst2));
   }
   // ptr + (off + cst) -> (ptr + off) + cst
   if(auto* bin = dyn_cast<BinaryOperator>(off))
   if(bin->getOpcode() == llvm::BinaryOperator::BinaryOps::Add)
   if(ConstantInt* cst = dyn_cast<ConstantInt>(bin->getOperand(1))){
-    return (*builder_)->CreateGEP((*builder_)->CreateGEP(ptr, bin->getOperand(0)),
+    return (*builder_)->CreateGEP(elem_ty, (*builder_)->CreateGEP(elem_ty, ptr, bin->getOperand(0)),
                                   bin->getOperand(1));
   }
   // default
- return (*builder_)->CreateGEP(ptr, off, name);
+ return (*builder_)->CreateGEP(elem_ty, ptr, off, name);
 }
 
 //Value* geper::operator()(Type *ty, Value *ptr, std::vector<Value *> vals, const std::string &name) {
@@ -94,6 +96,7 @@ Value* geper::operator()(Value *ptr, Value* off, const std::string& name){
 #define i64_ty               builder_->getInt64Ty()
 #define vec_ty(type, num_el) VectorType::get(type, num_el, false)
 #define ptr_ty(...)          PointerType::get(__VA_ARGS__)
+#define elemty_of_ptr(val)   (val)->getType()->getNonOpaquePointerElementType()
 // constants
 #define i32(...)             builder_->getInt32(__VA_ARGS__)
 // ops
@@ -323,16 +326,18 @@ void generator::visit_launch_inst(ir::launch_inst *launch) {
   builder_->SetInsertPoint(launch_bb);
 
   //
-  builder_->CreateStore(vals_[launch->get_grid()[0]][{}], builder_->CreateGEP(grid, {_0, _0}));
-  builder_->CreateStore(vals_[launch->get_grid()[1]][{}], builder_->CreateGEP(grid, {_0, _1}));
-  builder_->CreateStore(vals_[launch->get_grid()[2]][{}], builder_->CreateGEP(grid, {_0, _2}));
+  auto grid_ty = elemty_of_ptr(grid);
+  auto block_ty = elemty_of_ptr(block);
+  builder_->CreateStore(vals_[launch->get_grid()[0]][{}], builder_->CreateGEP(grid_ty, grid, {_0, _0}));
+  builder_->CreateStore(vals_[launch->get_grid()[1]][{}], builder_->CreateGEP(grid_ty, grid, {_0, _1}));
+  builder_->CreateStore(vals_[launch->get_grid()[2]][{}], builder_->CreateGEP(grid_ty, grid, {_0, _2}));
   Value* num_warps = mul(builder_->getInt32(32), vals_[launch->get_num_warps()][{}]);
-  builder_->CreateStore(num_warps, builder_->CreateGEP(block, {_0, _0}));
-  builder_->CreateStore(builder_->getInt32(1), builder_->CreateGEP(block, {_0, _1}));
-  builder_->CreateStore(builder_->getInt32(1), builder_->CreateGEP(block, {_0, _2}));
+  builder_->CreateStore(num_warps, builder_->CreateGEP(block_ty, block, {_0, _0}));
+  builder_->CreateStore(builder_->getInt32(1), builder_->CreateGEP(block_ty, block, {_0, _1}));
+  builder_->CreateStore(builder_->getInt32(1), builder_->CreateGEP(block_ty, block, {_0, _2}));
   Function* called_fn = fns_[fn];
   Value* callee = ConstantExpr::getCast(Instruction::BitCast, called_fn, get_param_arg_tys[0]);
-  Value* arg_ptr = builder_->CreateCall(get_param_buffer, {callee, builder_->CreateLoad(grid), builder_->CreateLoad(block), builder_->getInt32(0)});
+  Value* arg_ptr = builder_->CreateCall(get_param_buffer, {callee, builder_->CreateLoad(grid_ty, grid), builder_->CreateLoad(block_ty, block), builder_->getInt32(0)});
   // forwrd-declare cudaLaunchDeviceV2
   std::vector<Type*> launch_device_arg_tys = {get_param_ty->getReturnType(), builder_->getInt64Ty()};
   FunctionType* launch_device_ty = FunctionType::get(builder_->getInt32Ty(), launch_device_arg_tys, false);
@@ -355,7 +360,8 @@ void generator::visit_launch_inst(ir::launch_inst *launch) {
     unsigned size = curr_arg_ty->isPointerTy() ? 8 : curr_arg_ty->getPrimitiveSizeInBits() / 8;
     off = (off + size - 1) / size * size;
     // get pointer to current arg
-    Value* curr_arg_ptr = builder_->CreateGEP(arg_ptr, builder_->getInt32(off));
+    auto arg_ty = elemty_of_ptr(arg_ptr);
+    Value* curr_arg_ptr = builder_->CreateGEP(arg_ty, arg_ptr, builder_->getInt32(off));
     curr_arg_ptr = builder_->CreateBitCast(curr_arg_ptr, curr_arg_ty->getPointerTo(addr_space));
     // store arg
     builder_->CreateStore(curr_arg, curr_arg_ptr);
@@ -2880,9 +2886,10 @@ void generator::visit_function(ir::function* fn) {
     if(attr.is_llvm_attr()){
       llvm::Attribute llattr = cvt(attr);
       if(llattr.getKindAsEnum() != llvm::Attribute::None)
-        ret->addAttribute(id, cvt(attr));
+        ret->addAttributeAtIndex(id, cvt(attr));
     }
   }
+  // ret->setAttributes();
   // set metadata
   if(tgt_->is_gpu()){
       tgt_->set_kernel(*builder_, ctx, mod_, ret);

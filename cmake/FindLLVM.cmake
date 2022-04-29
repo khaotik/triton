@@ -1,4 +1,3 @@
-
 # - Find LLVM headers and libraries.
 # This module locates LLVM and adapts the llvm-config output for use with
 # CMake.
@@ -33,13 +32,12 @@
 # We also want an user-specified LLVM_ROOT_DIR to take precedence over the
 # system default locations such as /usr/local/bin. Executing find_program()
 # multiples times is the approach recommended in the docs.
-set(llvm_config_names llvm-config-12.0 llvm-config120 llvm-config-12 llvm-config-12-64
-                      llvm-config-11.0 llvm-config110 llvm-config-11 llvm-config-11-64
-                      llvm-config-10.0 llvm-config100 llvm-config-10 llvm-config-10-64
-                      llvm-config-9.0 llvm-config90 llvm-config-9 llvm-config-9-64
-                      llvm-config-8.0 llvm-config80 llvm-config-8 llvm-config-8-64
-                      llvm-config-7.0 llvm-config70 llvm-config-7 llvm-config-7-64
-                      llvm-config-6.0 llvm-config60
+set(llvm_config_names llvm-config-14.0 llvm-config140 llvm-config-14
+                      llvm-config-13.0 llvm-config130 llvm-config-13
+                      llvm-config-12.0 llvm-config120 llvm-config-12
+                      llvm-config-11.0 llvm-config110 llvm-config-11
+                      llvm-config-10.0 llvm-config100 llvm-config-10
+                      llvm-config-9.0 llvm-config90 llvm-config-9
                       llvm-config)
 find_program(LLVM_CONFIG
     NAMES ${llvm_config_names}
@@ -50,11 +48,11 @@ if(APPLE)
     # extra fallbacks for MacPorts & Homebrew
     find_program(LLVM_CONFIG
         NAMES ${llvm_config_names}
-        PATHS /opt/local/libexec/llvm-11/bin  /opt/local/libexec/llvm-10/bin  /opt/local/libexec/llvm-9.0/bin
-              /opt/local/libexec/llvm-8.0/bin /opt/local/libexec/llvm-7.0/bin /opt/local/libexec/llvm-6.0/bin
+        PATHS /opt/local/libexec/llvm-14/bin  /opt/local/libexec/llvm-13/bin  /opt/local/libexec/llvm-12/bin
+              /opt/local/libexec/llvm-11/bin  /opt/local/libexec/llvm-10/bin  /opt/local/libexec/llvm-9.0/bin
               /opt/local/libexec/llvm/bin
+              /usr/local/opt/llvm@14/bin /usr/local/opt/llvm@13/bin /usr/local/opt/llvm@12/bin
               /usr/local/opt/llvm@11/bin /usr/local/opt/llvm@10/bin /usr/local/opt/llvm@9/bin
-              /usr/local/opt/llvm@8/bin  /usr/local/opt/llvm@7/bin  /usr/local/opt/llvm@6/bin
               /usr/local/opt/llvm/bin
         NO_DEFAULT_PATH)
 endif()
@@ -83,7 +81,7 @@ else()
         endif()
         set(result_code)
         execute_process(
-            COMMAND ${LLVM_CONFIG} --link-static --${flag}
+            COMMAND ${LLVM_CONFIG} --${flag}
             RESULT_VARIABLE result_code
             OUTPUT_VARIABLE LLVM_${var}
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -103,7 +101,7 @@ else()
         endif()
         set(result_code)
         execute_process(
-            COMMAND ${LLVM_CONFIG} --link-static --${flag} ${components}
+            COMMAND ${LLVM_CONFIG} --${flag} ${components}
             RESULT_VARIABLE result_code
             OUTPUT_VARIABLE tmplibs
             OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -141,7 +139,7 @@ else()
     endif()
 
     llvm_set(LIBRARY_DIRS libdir true)
-    llvm_set_libs(LIBRARIES libfiles "${LLVM_FIND_COMPONENTS}")
+    llvm_set_libs(LIBRARIES libs "${LLVM_FIND_COMPONENTS}")
     # LLVM bug: llvm-config --libs tablegen returns -lLLVM-3.8.0
     # but code for it is not in shared library
     if("${LLVM_FIND_COMPONENTS}" MATCHES "tablegen")
