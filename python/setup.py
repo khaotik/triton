@@ -129,9 +129,9 @@ setup(
     long_description="",
     packages=["triton", "triton/_C", "triton/language", "triton/tools", "triton/ops", "triton/ops/blocksparse"],
     install_requires=[
-        "cmake",
+        #  "cmake",
         "filelock",
-        "torch",
+        # "torch",
     ],
     package_data={"triton/ops": ["*.c"], "triton/ops/blocksparse": ["*.c"]},
     include_package_data=True,

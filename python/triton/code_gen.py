@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import ast
 import builtins
+import ctypes
 import functools
 import hashlib
+import importlib
 import inspect
 import os
 import pickle
@@ -15,20 +17,183 @@ import time
 import warnings
 from typing import Dict, Set, Tuple, Union
 
-import torch
 from filelock import FileLock
 
 import triton
 import triton._C.libtriton.triton as _triton
 from .tools.disasm import extract
 
+__all__ = []
+def export(obj):
+    __all__.append(obj.__name__)
+    return obj
 
-def current_cuda_stream(device_idx=0):
-    # Torch's torch.cuda.current_stream() is slow. We provide this
-    # function to give the user an opportunity to monkey-patch their
-    # own faster current stream lookup.
-    return torch.cuda.current_stream().cuda_stream
+class Bridge:
+    '''framework specific functions'''
+    typename_lut = {
+        triton.language.float8: 'f8',
+        triton.language.uint8: 'u8',
+        triton.language.uint16: 'u16',
+        triton.language.uint32: 'u32',
+        triton.language.uint64: 'u64',
+    }
+    def get_data_ptr(self, obj):
+        return None
+    def type_name(self,obj):
+        if self.get_data_ptr(obj):
+            return self.typename_lut[obj.dtype]
+        if isinstance(obj, triton.language.constexpr):
+            obj = obj.value
+        if isinstance(obj, int):
+            if -2**31 <= obj < 2**31:
+                return 'i32'
+            elif 2**31 <= obj < 2**32:
+                return 'u32'
+            elif -2**63 <= obj < 2**63:
+                return 'i64'
+            elif 2**63 <= obj < 2**64:
+                return 'u64'
+            else:
+                raise ValueError(f'integer overflow representing {obj}')
+        if isinstance(obj, float):
+            return 'f'
+        if isinstance(obj, bool):
+            return 'B'
+        if isinstance(obj, str):
+            return 'str'
+        raise NotImplementedError(f'could not compute type name for {obj}')
+    def to_python_ir(self, obj):
+        raise NotImplementedError()
+    def is_framework_tensor(self, obj)->bool:
+        raise NotImplementedError()
+    def is_cpu_tensor(self, obj)->bool:
+        raise NotImplementedError()
+    def get_device(self, obj=None):
+        '''return device, compute_cap, stream'''
+        raise NotImplementedError()
+    def get_backend_type(self):
+        raise NotImplementedError()
 
+class TorchBridge(Bridge):
+    def __init__(self):
+        torch = importlib.import_module('torch')
+        typename_lut = Bridge.typename_lut.copy()
+        typename_lut.update({
+            torch.bfloat16: 'bf16',
+            torch.float16: 'f16',
+            torch.float32: 'f32',
+            torch.float64: 'f64',
+            torch.bool: 'i1',
+            torch.int8: 'i8',
+            torch.int16: 'i16',
+            torch.int32: 'i32',
+            torch.int64: 'i64',
+        })
+        self.torch = torch
+        self.typename_lut = typename_lut
+    def get_data_ptr(self, obj):
+        return getattr(obj, 'data_ptr', None)
+    def to_python_ir(self, obj):
+        # convert torch.Tensor to Triton IR pointers
+        if hasattr(obj, 'data_ptr'):
+            name = self.type_name(obj)
+            return 'ptr', name
+        # default path returns triton.ir.type directly
+        name = self.type_name(obj)
+        return 'scalar', name
+    def is_framework_tensor(self, obj):
+        return isinstance(obj, self.torch.Tensor)
+    def is_cpu_tensor(self, obj):
+        return hasattr(arg, 'data_ptr') and (not arg.is_cuda)
+    def get_device(self, obj=None):
+        torch = self.torch
+        # set device (i.e., make sure torch has the context initialized)
+        device = torch.cuda.current_device()
+        torch.cuda.set_device(device)
+        # query compute capability
+        cc = torch.cuda.get_device_capability(device)
+        cc = str(cc[0]) + '-' + str(cc[1])
+        stream = self.torch.cuda.current_stream().cuda_stream
+        return device, cc, stream
+    def get_backend_type(self):
+        if self.torch.version.hip is None:
+            return _triton.runtime.backend.CUDA
+        else:
+            return _triton.runtime.backend.ROCM
+
+class MxnetBridge(Bridge):
+    def __init__(self):
+        mxnet = importlib.import_module('mxnet')
+        np = importlib.import_module('numpy')
+        typename_lut = Bridge.typename_lut.copy()
+        typename_lut.update({
+            np.float16: 'f16',
+            np.float32: 'f32',
+            np.float64: 'f64',
+            # DEPRECATED np.bool: 'i1',
+            np.int8: 'i8',
+            np.int16: 'i16',
+            np.int32: 'i32',
+            np.int64: 'i64',
+        })
+        self.typename_lut = typename_lut
+        self.mxnet = mxnet
+        self.libmxnet = mxnet.base._LIB
+        self.libcuda = ctypes.CDLL('libcuda.so')
+        self.device_cap_cache = {}
+        self.numpy = np
+    def get_data_ptr(self, obj):
+        h = getattr(obj, 'handle', None)
+        if h is None:
+            return None
+        ret = ctypes.c_void_p()
+        self.libmxnet.MXNDArrayGetData(h, ctypes.byref(ret));
+        return ret.value
+    def to_python_ir(self, obj):
+        # convert torch.Tensor to Triton IR pointers
+        if hasattr(obj, 'handle'):
+            name = self.type_name(obj)
+            return 'ptr', name
+        # default path returns triton.ir.type directly
+        name = self.type_name(obj)
+        return 'scalar', name
+    def _get_cuda_caps(self, device_id:int=0):
+        cache = self.device_cap_cache
+        caps = cache.get(device_id)
+        if caps is None:
+            libcuda = self.libcuda
+            ret = ctypes.c_int()
+            libcuda.cuDeviceGetAttribute(ctypes.byref(ret), 75, device_id)
+            major = ret.value
+            libcuda.cuDeviceGetAttribute(ctypes.byref(ret), 76, device_id)
+            minor = ret.value
+            caps = (major, minor)
+            cache[device_id] = caps
+        return caps
+    def is_framework_tensor(self, obj):
+        mx = self.mxnet
+        return isinstance(obj, (mx.ndarray.NDArray, mx.numpy.ndarray))
+    def is_cpu_tensor(self, obj):
+        if self.is_framework_tensor(obj):
+            return obj.device.device_type == 'cpu'
+        else:
+            return False
+    def get_backend_type(self):
+        return _triton.runtime.backend.CUDA
+    def get_device(self, obj=None):
+        # MXGetCurrentStream to get stream
+        libmxnet = self.libmxnet
+        if obj is None:
+            device = self.mxnet.gpu()
+        else:
+            device = obj.device
+        device_id = device.device_id
+        stream_id = ctypes.c_int(0)
+        libmxnet.MXGetCurrentStream(device_id, ctypes.byref(stream_id))
+        cc = '{}-{}'.format(*self._get_cuda_caps(device_id))
+        return device_id, cc, stream_id.value
+
+bridge = dict(torch=TorchBridge, mxnet=MxnetBridge)[os.getenv('TRITON_BRIDGE', 'torch').lower()]()
 
 def mangle_ty(ty):
     if ty.is_ptr():
@@ -65,10 +230,8 @@ def mangle_fn(name, arg_tys, constants):
     ret = f'{name}__{mangled_arg_names}__{mangled_constants}'
     return ret
 
-
 def is_triton_tensor(value):
     return isinstance(value, triton.language.tensor)
-
 
 class ValueConstructor:
     def __init__(self, module, builder, gscope) -> None:
@@ -84,7 +247,7 @@ class ValueConstructor:
         #
         self.builtins = {
             'range': range,
-            'min': triton.language.minimum,
+            'min': triton.language.min,
             'float': float,
             'int': int,
             'print': print,
@@ -208,7 +371,6 @@ class ValueConstructor:
         phi.handle.erase_from_parent()
         # TODO: remove trivial phis recursively
         return triton.language.tensor(v, phi.type)
-
 
 class CodeGenerator(ast.NodeVisitor):
 
@@ -780,6 +942,7 @@ class LoadedBinary:
         return self.sass
 
 
+@export
 class CompilationError(Exception):
     def __init__(self, src, node):
         self.message = f'at {node.lineno}:{node.col_offset}:\n'
@@ -794,6 +957,7 @@ class CompilationError(Exception):
         return (type(self), (self.src, self.node))
 
 
+@export
 class OutOfResources(Exception):
     def __init__(self, required, limit, name):
         self.message = f'out of resource: {name}, '\
@@ -809,59 +973,8 @@ class OutOfResources(Exception):
         return (type(self), (self.required, self.limit, self.name))
 
 
+@export
 class Kernel:
-
-    @staticmethod
-    def _type_name(obj):
-        type_names = {
-            triton.language.float8: 'f8',
-            torch.bfloat16: 'bf16',
-            torch.float16: 'f16',
-            torch.float32: 'f32',
-            torch.float64: 'f64',
-            torch.bool: 'i1',
-            torch.int8: 'i8',
-            torch.int16: 'i16',
-            torch.int32: 'i32',
-            torch.int64: 'i64',
-            triton.language.uint8: 'u8',
-            triton.language.uint16: 'u16',
-            triton.language.uint32: 'u32',
-            triton.language.uint64: 'u64',
-        }
-        if hasattr(obj, 'data_ptr'):
-            return type_names[obj.dtype]
-        if isinstance(obj, triton.language.constexpr):
-            obj = obj.value
-        if isinstance(obj, int):
-            if -2**31 <= obj < 2**31:
-                return 'i32'
-            elif 2**31 <= obj < 2**32:
-                return 'u32'
-            elif -2**63 <= obj < 2**63:
-                return 'i64'
-            elif 2**63 <= obj < 2**64:
-                return 'u64'
-            else:
-                raise ValueError(f'integer overflow representing {obj}')
-        if isinstance(obj, float):
-            return 'f'
-        if isinstance(obj, bool):
-            return 'B'
-        if isinstance(obj, str):
-            return 'str'
-        raise NotImplementedError(f'could not compute type name for {obj}')
-
-    @staticmethod
-    def _to_python_ir(obj):
-        # convert torch.Tensor to Triton IR pointers
-        if hasattr(obj, 'data_ptr'):
-            name = Kernel._type_name(obj)
-            return 'ptr', name
-        # default path returns triton.ir.type directly
-        name = Kernel._type_name(obj)
-        return 'scalar', name
-
     @staticmethod
     def _to_triton_ir(obj):
         which, name = obj
@@ -926,10 +1039,10 @@ class Kernel:
         constants = {i: arg for i, arg in enumerate(wargs) if isinstance(arg, int) and arg == 1 and i not in self.fn.do_not_specialize}
         constants.update({i: arg.value for i, arg in enumerate(wargs) if isinstance(arg, triton.language.constexpr)})
         constants.update({i: None for i, arg in enumerate(wargs) if arg is None})
-        arg_types = [Kernel._to_python_ir(arg) for i, arg in enumerate(wargs) if i not in constants]
+        arg_types = [bridge.to_python_ir(arg) for i, arg in enumerate(wargs) if i not in constants]
         return self.fn._warmup(key, arg_types=arg_types, device=device_idx, attributes=attributes, constants=constants, num_warps=num_warps, num_stages=num_stages, is_manual_warmup=False)
 
-    def __call__(self, *wargs, grid, num_warps=4, num_stages=2, **kwargs):
+    def __call__(self, *wargs, grid, num_warps=4, num_stages=2, stream=None, **kwargs):
         # handle arguments passed by name
         kwargs = {self.fn.arg_names.index(name): value for name, value in kwargs.items()}
         wargs = list(wargs)
@@ -943,17 +1056,11 @@ class Kernel:
             wargs[pos] = _type(wargs[pos])
         # check that tensors are on GPU.
         for arg in wargs:
-            if hasattr(arg, 'data_ptr'):
-                assert arg.is_cuda, "All tensors must be on GPU!"
-        # set device (i.e., make sure torch has the context initialized)
-        device = torch.cuda.current_device()
-        torch.cuda.set_device(device)
-        # query compute capability
-        cc = torch.cuda.get_device_capability(device)
-        cc = str(cc[0]) + '-' + str(cc[1])
+            assert (not bridge.is_cpu_tensor(arg)), "All tensors must be on GPU!"
+        device, cc, stream_ = bridge.get_device()
+        if stream is None:
+            stream = stream_
         cache_key = self.fn.cache_key + cc
-        # query current stream
-        stream = current_cuda_stream(device)
         return _triton.runtime.launch(wargs, self.fn.do_not_specialize, cache_key, self.fn.arg_names,
                                       device, stream, self.fn.bin_cache, num_warps, num_stages, self.add_to_cache,
                                       grid)
@@ -1055,6 +1162,7 @@ class Autotuner:
         return self.kernel(*args, num_warps=config.num_warps, num_stages=config.num_stages, **kwargs, **config.kwargs)
 
 
+@export
 @functools.lru_cache()
 def version_key():
     import pkgutil
@@ -1114,6 +1222,7 @@ class DependenciesFinder(ast.NodeVisitor):
         self.ret = hashlib.md5(self.ret).hexdigest()
 
 
+@export
 class JITFunction:
 
     cache_hook = None
@@ -1265,10 +1374,7 @@ class JITFunction:
                 raise e
             raise CompilationError(self.src, node) from e
         # Compile to machine code
-        if torch.version.hip is None:
-            backend = _triton.runtime.backend.CUDA
-        else:
-            backend = _triton.runtime.backend.ROCM
+        backend = bridge.get_backend_type()
         name, asm, shared_mem = _triton.code_gen.compile_ttir(backend, generator.module, device, num_warps, num_stages)
         max_shared_memory = _triton.runtime.max_shared_memory(backend, device)
         if shared_mem > max_shared_memory:
@@ -1282,6 +1388,7 @@ class JITFunction:
         return f"JITFunction({self.module}:{self.fn.__name__})"
 
 
+@export
 class Config:
     """
     An object that represents a possible kernel configuration for the auto-tuner to try.
@@ -1314,6 +1421,7 @@ class Config:
         return ', '.join(res)
 
 
+@export
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None):
     """
     Decorator for auto-tuning a :code:`triton.jit`'d function.
@@ -1358,6 +1466,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None):
     return decorator
 
 
+@export
 def heuristics(values):
     """
     Decorator for specifying how the values of certain meta-parameters may be computed.
@@ -1391,6 +1500,7 @@ def heuristics(values):
     return decorator
 
 
+@export
 def jit(*args, **kwargs):
     """
     Decorator for JIT-compiling a function using the Triton compiler.
@@ -1449,6 +1559,7 @@ def next_power_of_2(n):
 ######
 
 
+@export
 class TensorWrapper:
     def __init__(self, base, dtype):
         self.dtype = dtype
@@ -1462,7 +1573,7 @@ class TensorWrapper:
     def __str__(self) -> str:
         return f'TensorWrapper[{self.dtype}]({self.base})'
 
-
+@export
 def reinterpret(tensor, dtype):
     if isinstance(tensor, TensorWrapper):
         if dtype == tensor.base.dtype:
@@ -1471,7 +1582,7 @@ def reinterpret(tensor, dtype):
         else:
             # Reinterpreting a wrapped tensor to a different type.
             return TensorWrapper(tensor.base, dtype)
-    elif isinstance(tensor, torch.Tensor):
+    elif bridge.is_framework_tensor(tensor):
         # A new wrapper is needed around an unwrapped tensor.
         return TensorWrapper(tensor, dtype)
     else:

@@ -122,10 +122,26 @@ std::string dtype_cache_key_part(const py::object& dtype) {
     py::object repr = py::repr(dtype);
     size_t repr_len = PyUnicode_GET_LENGTH(repr.ptr());
     const char* repr_ptr = (const char*)PyUnicode_1BYTE_DATA(repr.ptr());
-    if (repr_len <= 6 || strncmp(repr_ptr, "torch.", 6)) {
+    if (repr_len <= 6 || (strncmp(repr_ptr, "torch.", 6)!=0 && strncmp(repr_ptr, "numpy.", 6)!=0)) {
       throw std::logic_error("invalid dtype: " + std::string(repr_ptr, repr_len));
     }
     return std::string(repr_ptr + 6, repr_len - 6);
+  }
+}
+
+std::string npy_dtype_cache_key_part(const py::object& dtype) {
+  if (py::hasattr(dtype, "cache_key_part")) {
+    // Presumed to be a triton.language.dtype.
+    return std::string(py::str(py::getattr(dtype, "cache_key_part")));
+  } else {
+    // <class 'numpy.xxx'>
+    py::object repr = py::repr(dtype);
+    size_t repr_len = PyUnicode_GET_LENGTH(repr.ptr());
+    const char* repr_ptr = (const char*)PyUnicode_1BYTE_DATA(repr.ptr());
+    if (repr_len <= 6 || (strncmp(repr_ptr, "<class 'numpy.", 14)!=0 && strncmp(repr_ptr+repr_len-2, "'>", 2)!=0)) {
+      throw std::logic_error("invalid dtype: " + std::string(repr_ptr, repr_len));
+    }
+    return std::string(repr_ptr + 14, repr_len - 16);
   }
 }
 
@@ -218,7 +234,7 @@ void parse_args(py::list& args, py::list do_not_specialize, const std::string& f
         params_ptr += 1;
         continue;
       }
-      // argument is tensor
+      // argument is torch.Tensor
       if(py::hasattr(arg, "data_ptr")){
         py::object data_ptr = arg.attr("data_ptr")();
         long value = data_ptr.cast<long>();
@@ -235,7 +251,7 @@ void parse_args(py::list& args, py::list do_not_specialize, const std::string& f
         cache_key += ")]";
         continue;
       }
-      // argument is `constexpr`
+      // argument is either `constexpr`
       if(py::hasattr(arg, "value")){
         py::object value = arg.attr("value");
         py::object name = arg_names[i];
@@ -247,6 +263,23 @@ void parse_args(py::list& args, py::list do_not_specialize, const std::string& f
         continue;
       }
       std::string ty_str = arg.attr("__class__").attr("__name__").cast<std::string>();
+      if(ty_str == "NDArray"){
+        // TODO properly include mxnet header and use offsetof(tblob_) to get offset
+        long handle_ptr = arg.attr("handle").attr("value").cast<long>();
+        long ptrvalue = ((long*)handle_ptr)[21];
+        params_ptr = (char*)(((uintptr_t)params_ptr + 7) & (-8));
+        // copy param
+        std::memcpy(params_ptr, &ptrvalue, 8);
+        params_ptr += 8;
+        // udpate cache key
+        cache_key += npy_dtype_cache_key_part(arg.attr("dtype"));
+        cache_key += "*";
+        cache_key += "[multipleof(";
+        size_t range_size = get_pointer_range_size(ptrvalue);
+        cache_key += std::to_string(std::min(pow2_divisor(ptrvalue), pow2_divisor(range_size)));
+        cache_key += ")]";
+        continue;
+      }
       if(ty_str == "NoneType"){
         cache_key += "None";
         continue;
