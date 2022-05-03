@@ -135,11 +135,27 @@ class MxnetBridge(Bridge):
             np.int16: 'i16',
             np.int32: 'i32',
             np.int64: 'i64',
+            np.uint8: 'u8',
+            np.uint16: 'u16',
+            np.uint32: 'u32',
+            np.uint64: 'u64',
+            np.dtype('float16'): 'f16',
+            np.dtype('float32'): 'f32',
+            np.dtype('float64'): 'f64',
+            np.dtype('int8'): 'i8',
+            np.dtype('int16'): 'i16',
+            np.dtype('int32'): 'i32',
+            np.dtype('int64'): 'i64',
+            np.dtype('uint8'): 'u8',
+            np.dtype('uint16'): 'u16',
+            np.dtype('uint32'): 'u32',
+            np.dtype('uint64'): 'u64',
         })
         self.typename_lut = typename_lut
         self.mxnet = mxnet
         self.libmxnet = mxnet.base._LIB
         self.libcuda = ctypes.CDLL('libcuda.so')
+        self.libcudart = ctypes.CDLL('libcudart.so')
         self.device_cap_cache = {}
         self.numpy = np
     def get_data_ptr(self, obj):
@@ -181,10 +197,10 @@ class MxnetBridge(Bridge):
     def get_backend_type(self):
         return _triton.runtime.backend.CUDA
     def get_device(self, obj=None):
-        # MXGetCurrentStream to get stream
         libmxnet = self.libmxnet
+        #  self.libcudart.cudaFree(ctypes.c_void_p(0)) # make sure runtime creates a driver ctx
         if obj is None:
-            device = self.mxnet.gpu()
+            device = self.mxnet.device.current_device()
         else:
             device = obj.device
         device_id = device.device_id

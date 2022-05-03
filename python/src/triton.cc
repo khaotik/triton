@@ -138,10 +138,25 @@ std::string npy_dtype_cache_key_part(const py::object& dtype) {
     py::object repr = py::repr(dtype);
     size_t repr_len = PyUnicode_GET_LENGTH(repr.ptr());
     const char* repr_ptr = (const char*)PyUnicode_1BYTE_DATA(repr.ptr());
-    if (repr_len <= 6 || (strncmp(repr_ptr, "<class 'numpy.", 14)!=0 && strncmp(repr_ptr+repr_len-2, "'>", 2)!=0)) {
-      throw std::logic_error("invalid dtype: " + std::string(repr_ptr, repr_len));
+    auto invalid_dtype_error = std::logic_error("invalid dtype: \"" + std::string(repr_ptr, repr_len) + "\"");
+    if (repr_len <= 6) {
+      throw invalid_dtype_error;
     }
-    return std::string(repr_ptr + 14, repr_len - 16);
+    if (repr_ptr[0] == '<') {
+      if(strncmp(repr_ptr, "<class 'numpy.", 14)!=0 && strncmp(repr_ptr+repr_len-2, "'>", 2)!=0) {
+        throw invalid_dtype_error;
+      } else {
+        return std::string(repr_ptr + 14, repr_len - 16);
+      }
+    } else if (repr_ptr[0] == 'd') {
+      if(strncmp(repr_ptr, "dtype('", 7)!=0 && strncmp(repr_ptr+repr_len-2, "')", 2)!=0) {
+        throw invalid_dtype_error;
+      } else {
+        return std::string(repr_ptr + 7, repr_len - 9);
+      }
+    } else {
+        throw invalid_dtype_error;
+    }
   }
 }
 
@@ -263,7 +278,7 @@ void parse_args(py::list& args, py::list do_not_specialize, const std::string& f
         continue;
       }
       std::string ty_str = arg.attr("__class__").attr("__name__").cast<std::string>();
-      if(ty_str == "NDArray"){
+      if(ty_str == "NDArray" || ty_str == "ndarray"){
         // TODO properly include mxnet header and use offsetof(tblob_) to get offset
         long handle_ptr = arg.attr("handle").attr("value").cast<long>();
         long ptrvalue = ((long*)handle_ptr)[21];
