@@ -191,14 +191,27 @@ class MxnetBridge(Bridge):
         return isinstance(obj, (mx.ndarray.NDArray, mx.numpy.ndarray))
     def is_cpu_tensor(self, obj):
         if self.is_framework_tensor(obj):
-            return obj.device.device_type == 'cpu'
+            if obj.device.device_type == 'cpu':
+                return True
+            else:
+                # this makes sure array data is allocated
+                self.libmxnet.MXNDArrayGetData(obj.handle, ctypes.byref(ctypes.c_void_p()))
+                return False
         else:
             return False
     def get_backend_type(self):
         return _triton.runtime.backend.CUDA
     def get_device(self, obj=None):
         libmxnet = self.libmxnet
-        #  self.libcudart.cudaFree(ctypes.c_void_p(0)) # make sure runtime creates a driver ctx
+        c_void_p = ctypes.c_void_p
+        byref = ctypes.byref
+        libcuda = self.libcuda
+        _ptr = c_void_p()
+        libcuda.cuCtxGetCurrent(byref(_ptr))
+        if _ptr.value is None:
+            # ensure cuda runtime initializes cuda driver ctx per for this thread*device
+            self.libcudart.cudaFree(_ptr)
+        libcuda.cuCtxGetCurrent(byref(_ptr))
         if obj is None:
             device = self.mxnet.device.current_device()
         else:
@@ -988,7 +1001,6 @@ class OutOfResources(Exception):
         # this is necessary to make CompilationError picklable
         return (type(self), (self.required, self.limit, self.name))
 
-
 @export
 class Kernel:
     @staticmethod
@@ -1038,7 +1050,6 @@ class Kernel:
 
     def add_to_cache(self, key, wargs, device_idx, num_warps, num_stages):
         tensor_idxs = [i for i, arg in enumerate(wargs) if hasattr(arg, 'data_ptr')]
-
         # attributes
         attributes = dict()
         for i, arg in enumerate(wargs):
